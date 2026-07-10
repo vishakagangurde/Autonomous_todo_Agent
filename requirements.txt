@@ -1,0 +1,28 @@
+
+# Web Framework Layer
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-docx
+openai>=1.0.0
+
+# Data Validation / Contracts
+pydantic==2.10.3
+pydantic-settings
+
+# LLM (NVIDIA NIM via OpenAI-compatible API)
+openai>=1.0.0
+
+# Document Generation (pure Python, no LLM dependency)
+python-docx
+
+# Configuration / Environment
+python-dotenv==1.0.1
+
+
+# Frontend
+streamlit>=1.35.0
+
+
+# Testing
+pytest==8.3.4
+httpx==0.28.1

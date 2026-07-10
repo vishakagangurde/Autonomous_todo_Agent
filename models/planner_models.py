@@ -1,0 +1,231 @@
+"""
+models/planner_models.py
+
+Defines the structured contract produced by the Planner Agent and
+consumed by every downstream agent: Content Generation, Review, and
+Document Generation.
+
+This file is the formal, inspectable representation of the system's
+"TODO list" — the assignment requires the agent to plan its own
+execution and create its own task list; ExecutionPlan IS that plan,
+not a hidden string inside a prompt.
+"""
+
+from dataclasses import dataclass, field as dc_field
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+from utils.constants import DocumentType, TaskStatus, SectionStatus
+
+
+class ExtractedInformation(BaseModel):
+    """
+    Structured information pulled out of the user's free-text request.
+    """
+
+    topic: Optional[str] = Field(
+        default=None,
+        description="The core subject of the document, e.g. "
+                    "'SaaS product launch for small e-commerce businesses'.",
+    )
+    audience: Optional[str] = Field(
+        default=None,
+        description="Who the document is intended for, e.g. "
+                    "'potential investors' or 'internal engineering team'.",
+    )
+    tone: Optional[str] = Field(
+        default=None,
+        description="Desired tone, e.g. 'formal', 'persuasive', 'technical'.",
+    )
+    key_entities: list[str] = Field(
+        default_factory=list,
+        description="Named entities explicitly mentioned in the request "
+                    "(company names, product names, dates, numbers).",
+    )
+    extracted_fields: dict[str, str] = Field(
+        default_factory=dict,
+        description="Any additional template-required fields the user "
+                    "already supplied in their request, keyed by the "
+                    "field name defined in document_templates.py.",
+    )
+
+
+class MissingField(BaseModel):
+    """
+    A required field (per the document template) that the user did NOT
+    supply in their request.
+
+    """
+
+    field_name: str = Field(..., description="Name of the missing required field.")
+    reason: str = Field(
+        default="Not mentioned in the original request.",
+        description="Why this field is considered missing.",
+    )
+
+
+class Assumption(BaseModel):
+    """
+    A reasonable default value the system generated to fill a
+    MissingField gap, so execution can proceed without blocking on
+    user clarification.
+
+    """
+
+    field_name: str = Field(..., description="Which missing field this assumption fills.")
+    assumed_value: str = Field(..., description="The assumed value.")
+    reasoning: str = Field(
+        ..., description="Brief justification for why this assumption is reasonable."
+    )
+
+    @property
+    def value(self) -> str:
+        """Alias for assumed_value, used by agents/planner.py for convenience."""
+        return self.assumed_value
+
+
+
+# Dataclass-based models 
+
+
+@dataclass
+class PlannedTask:
+    """
+    A lightweight task descriptor produced by PlannerAgent.create_tasks().
+   """
+
+    section_name: str
+    order: int
+    intent: str
+
+
+@dataclass
+class SimplifiedExecutionPlan:
+    """
+    Lightweight execution plan produced by PlannerAgent.build_execution_plan().
+
+    """
+
+    original_request: str
+    document_type: str
+    known_fields: Dict[str, str]
+    assumptions: Dict[str, Assumption]
+    tasks: List[PlannedTask]
+
+
+class Task(BaseModel):
+    """
+    A single unit of work in the execution plan — corresponds to
+    generating exactly one section of the final document.
+
+    """
+
+    task_id: str = Field(..., description="Unique identifier, e.g. 'task_1'.")
+    section_name: str = Field(
+        ..., description="Name of the document section this task generates, "
+                          "must match a section defined in document_templates.py."
+    )
+    instructions: str = Field(
+        ..., description="Specific guidance for the Content Generation Agent "
+                          "on what this section should cover."
+    )
+    status: TaskStatus = Field(default=TaskStatus.PENDING)
+    order: int = Field(..., ge=0, description="Execution order, lower runs first.")
+
+    @field_validator("section_name")
+    @classmethod
+    def section_name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Task.section_name cannot be blank.")
+        return value.strip()
+
+
+class GeneratedSection(BaseModel):
+    """
+    The output of the Content Generation Agent for a single Task.
+
+   
+    """
+
+    section_name: str
+    content: str = Field(..., description="Generated section text content.")
+    task_id: str = Field(..., description="Which Task produced this section.")
+    review_status: SectionStatus = Field(default=SectionStatus.MISSING)
+    regeneration_count: int = Field(
+        default=0,
+        ge=0,
+        description="How many times this section has been regenerated by "
+                    "the Review Agent. Capped by "
+                    "MAX_REGENERATION_ATTEMPTS_PER_SECTION in constants.py "
+                    "to guarantee the pipeline terminates.",
+    )
+
+
+class ExecutionPlan(BaseModel):
+    """
+    The complete, structured plan produced by the Planner Agent.
+
+    This is the central object passed through the entire pipeline:
+
+        Planner creates it
+            -> Content Generation Agent populates `generated_sections`
+            -> Review Agent inspects/patches `generated_sections`
+            -> Document Generator reads the final state to build the .docx
+
+    
+    """
+
+    document_type: DocumentType = Field(
+        ..., description="Classified document type (Gemini Intent Classifier, "
+                          "constrained to the DocumentType enum)."
+    )
+    original_request: str = Field(..., description="The raw user request, verbatim.")
+    extracted_information: ExtractedInformation = Field(
+        default_factory=ExtractedInformation
+    )
+    missing_fields: list[MissingField] = Field(default_factory=list)
+    assumptions: list[Assumption] = Field(default_factory=list)
+    tasks: list[Task] = Field(
+        default_factory=list,
+        description="The autonomous TODO list — one Task per document section.",
+    )
+    generated_sections: list[GeneratedSection] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def get_task_by_id(self, task_id: str) -> Optional[Task]:
+        """Look up a single task by its id. Pure Python convenience accessor."""
+        return next((t for t in self.tasks if t.task_id == task_id), None)
+
+    def get_section_by_name(self, section_name: str) -> Optional[GeneratedSection]:
+        """Look up a generated section by name. Pure Python convenience accessor."""
+        return next(
+            (s for s in self.generated_sections if s.section_name == section_name),
+            None,
+        )
+
+    def all_tasks_completed(self) -> bool:
+        """
+        True if every task reached a terminal state (COMPLETED or SKIPPED).
+
+        Pure Python check — used by the Orchestrator to decide whether
+        execution can proceed to the Review stage.
+        """
+        terminal_states = {TaskStatus.COMPLETED, TaskStatus.SKIPPED}
+        return all(task.status in terminal_states for task in self.tasks)
+
+    def pending_review_sections(self) -> list[GeneratedSection]:
+        """
+        Sections that still need regeneration, respecting the retry cap.
+
+        Pure Python filter — used by the Review Agent to decide which
+        sections to send back to the Content Generation Agent.
+        """
+        from utils.constants import MAX_REGENERATION_ATTEMPTS_PER_SECTION
+
+        return [
+            s for s in self.generated_sections
+            if s.review_status == SectionStatus.NEEDS_REGENERATION
+            and s.regeneration_count < MAX_REGENERATION_ATTEMPTS_PER_SECTION
+        ]
